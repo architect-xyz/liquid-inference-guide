@@ -21,14 +21,7 @@ Agent skills for Liquid Inference. Each directory holds one `SKILL.md` with `nam
 
 ## Install
 
-Copy the directories you want into your agent's skills folder, for example for Claude Code:
-
-```bash
-mkdir -p ~/.claude/skills
-cp -R skills/liquid-* ~/.claude/skills/
-```
-
-OpenRouter's skills install with `gh skill install`. We have not checked that this repository's layout works with that command or with `npx skills`.
+See [Install the skills](../README.md#install-the-skills) in the main README.
 
 ## Status
 

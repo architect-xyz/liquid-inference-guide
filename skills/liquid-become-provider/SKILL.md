@@ -1,6 +1,6 @@
 ---
 name: liquid-become-provider
-description: Sell inference on Liquid Inference as a provider: registration, keys, the WebSocket quote session, dispatch endpoint and usage reporting, with reference agents in Python, TypeScript and Rust. Use when the user wants to list a model, write a provider agent, or debug login_reject/quote_reject.
+description: Sell inference on Liquid Inference as a provider. Covers registration, keys, the WebSocket quote session, the dispatch endpoint and usage reporting, with reference agents in Python, TypeScript and Rust. Use when the user wants to list a model, write a provider agent, or debug login_reject/quote_reject.
 ---
 
 # Becoming a Liquid Inference provider

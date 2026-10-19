@@ -17,6 +17,35 @@ Start with [getting started](docs/getting-started.md): get a key, set the base U
 
 [`skills/`](skills/README.md) holds fourteen agent skills (`SKILL.md` files) that teach a coding agent to use the exchange: quickstart, the Liquid CLI harness, purchasing rules, market data, receipts, troubleshooting, harness setup, agent SDKs, modalities (with scripts for images, speech, video and embeddings) and becoming a provider.
 
+### Install the skills
+
+With the GitHub CLI (`gh skill` is in preview; checked with `gh` 2.102.0):
+
+```bash
+# every skill, into the current project
+gh skill install architect-xyz/liquid-inference-guide --all
+
+# every skill, for your user, for one agent
+gh skill install architect-xyz/liquid-inference-guide --all --scope user --agent claude-code
+
+# one skill
+gh skill install architect-xyz/liquid-inference-guide liquid-quickstart
+```
+
+`--agent` takes a name such as `claude-code`, `codex`, `cursor`, `opencode` or `goose`; run `gh skill install --help` for the full list. Pin a version with `--pin <tag-or-sha>`.
+
+Without `gh`, copy the directories by hand:
+
+```bash
+git clone https://github.com/architect-xyz/liquid-inference-guide
+mkdir -p ~/.claude/skills
+cp -R liquid-inference-guide/skills/* ~/.claude/skills/
+```
+
+Use the skills folder of your agent in place of `~/.claude/skills`. Copy the whole directory of a skill, because the modality skills carry a `scripts/` folder. Those scripts need Node 22 or later and no install step. Start a new agent session after you install.
+
+An agent loads a skill when the task matches its description. To check, ask: "How do I send a first request to Liquid Inference?"
+
 ## Provider reference code
 
 | Language | Code | Guide |
