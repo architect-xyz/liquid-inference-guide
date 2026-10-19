@@ -15,7 +15,7 @@ Start with [getting started](docs/getting-started.md): get a key, set the base U
 
 ## Skills
 
-[`skills/`](skills/README.md) holds thirteen agent skills (`SKILL.md` files) that teach a coding agent to use the exchange: quickstart, purchasing rules, market data, receipts, troubleshooting, harness setup, agent SDKs, modalities (with scripts for images, speech, video and embeddings) and becoming a provider.
+[`skills/`](skills/README.md) holds fourteen agent skills (`SKILL.md` files) that teach a coding agent to use the exchange: quickstart, the Liquid CLI harness, purchasing rules, market data, receipts, troubleshooting, harness setup, agent SDKs, modalities (with scripts for images, speech, video and embeddings) and becoming a provider.
 
 ## Provider reference code
 

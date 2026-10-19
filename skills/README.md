@@ -9,6 +9,7 @@ Agent skills for Liquid Inference. Each directory holds one `SKILL.md` with `nam
 | [liquid-models-market](liquid-models-market/SKILL.md) | Read models, offers, prices and depth. |
 | [liquid-receipts-costs](liquid-receipts-costs/SKILL.md) | Read receipts, explain charges, attribute spend. |
 | [liquid-troubleshoot](liquid-troubleshoot/SKILL.md) | Diagnose error codes and harness symptoms. |
+| [install-liquid-harness](install-liquid-harness/SKILL.md) | Install the Liquid CLI and run a coding agent through it. |
 | [liquid-connect-harness](liquid-connect-harness/SKILL.md) | Configure a coding harness. |
 | [liquid-agent-sdk](liquid-agent-sdk/SKILL.md) | Run the Claude, OpenAI or Vercel agent SDKs on the exchange. |
 | [liquid-modalities](liquid-modalities/SKILL.md) | Overview of attachments, embeddings, images, speech, video. |
