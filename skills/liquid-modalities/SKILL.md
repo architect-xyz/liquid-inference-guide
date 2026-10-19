@@ -5,6 +5,8 @@ description: Send images, audio, PDFs, embeddings and speech/image/video generat
 
 # Modalities on Liquid Inference
 
+This is the overview. For scripts that discover models and run a job, use `liquid-images`, `liquid-speech`, `liquid-video` or `liquid-embeddings`.
+
 `GET /v1/exchange/models` shows each model's `input_modalities` and `output_modalities`; empty means text only. A request competes only across offers that declared the feature.
 
 ## Attachments in chat

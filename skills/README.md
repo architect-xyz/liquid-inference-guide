@@ -11,7 +11,11 @@ Agent skills for Liquid Inference. Each directory holds one `SKILL.md` with `nam
 | [liquid-troubleshoot](liquid-troubleshoot/SKILL.md) | Diagnose error codes and harness symptoms. |
 | [liquid-connect-harness](liquid-connect-harness/SKILL.md) | Configure a coding harness. |
 | [liquid-agent-sdk](liquid-agent-sdk/SKILL.md) | Run the Claude, OpenAI or Vercel agent SDKs on the exchange. |
-| [liquid-modalities](liquid-modalities/SKILL.md) | Attachments, embeddings, images, speech, video. |
+| [liquid-modalities](liquid-modalities/SKILL.md) | Overview of attachments, embeddings, images, speech, video. |
+| [liquid-images](liquid-images/SKILL.md) | Discover image models and generate images (scripts). |
+| [liquid-speech](liquid-speech/SKILL.md) | Discover speech models and synthesize audio (scripts). |
+| [liquid-video](liquid-video/SKILL.md) | Create, poll and download video (scripts). |
+| [liquid-embeddings](liquid-embeddings/SKILL.md) | Discover embedding models and embed text (scripts). |
 | [liquid-become-provider](liquid-become-provider/SKILL.md) | Sell inference with a provider agent. |
 
 ## Install
@@ -27,4 +31,4 @@ OpenRouter's skills install with `gh skill install`. We have not checked that th
 
 ## Status
 
-Written from the Liquid Inference product docs. Not tested by loading them into an agent. Skills that link to guides use paths in this repository, so they work best when the agent can reach it.
+Written from the Liquid Inference product docs. Not tested by loading them into an agent. The modality scripts' discovery commands ran against the live exchange; the commands that spend money were not run. Skills that link to guides use paths in this repository, so they work best when the agent can reach it.

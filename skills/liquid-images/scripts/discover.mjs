@@ -1,0 +1,22 @@
+// Lists models of kind "image_generation" from the public /v1/models endpoint (no key needed).
+// Usage: node discover.mjs [model-id]
+import { listModels, parseArgs } from './lib.mjs'
+
+const { positional } = parseArgs(process.argv.slice(2))
+const models = await listModels('image_generation')
+if (positional[0]) {
+  const m = models.find((x) => x.id === positional[0])
+  if (!m) {
+    console.error(`no image_generation model named ${positional[0]}; run without arguments to list them`)
+    process.exit(1)
+  }
+  console.log(JSON.stringify(m, null, 2))
+} else {
+  console.log(JSON.stringify(models.map((m) => ({ id: m.id, ...pick(m) })), null, 2))
+}
+
+function pick(m) {
+  const out = {}
+  for (const k of ['image_sizes', 'max_input_tokens']) if (m[k] !== undefined) out[k] = m[k]
+  return out
+}
