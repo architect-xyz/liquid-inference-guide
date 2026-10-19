@@ -19,6 +19,21 @@ Start with [getting started](docs/getting-started.md): get a key, set the base U
 
 ### Install the skills
 
+With `npx skills` (needs Node):
+
+```bash
+# every skill, for your user, for every agent it detects
+npx skills add architect-xyz/liquid-inference-guide --skill '*' --global --yes
+
+# one skill, for one agent
+npx skills add architect-xyz/liquid-inference-guide --skill liquid-quickstart --agent claude-code
+
+# list the skills without installing
+npx skills add architect-xyz/liquid-inference-guide --list
+```
+
+Leave out `--global` to install into the current project. Add `--copy` to copy files instead of symlinking them.
+
 With the GitHub CLI (`gh skill` is in preview; checked with `gh` 2.102.0):
 
 ```bash
