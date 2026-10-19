@@ -13,6 +13,10 @@ Start with [getting started](docs/getting-started.md): get a key, set the base U
 | [Frameworks](docs/frameworks/README.md) | Use LangChain, LlamaIndex or LiteLLM. | [index](docs/frameworks/README.md) |
 | [Providers](docs/providers/README.md) | Sell inference. Reference agents in Python, TypeScript and Rust. | [overview](docs/providers/README.md) |
 
+## Skills
+
+[`skills/`](skills/README.md) holds nine agent skills (`SKILL.md` files) that teach a coding agent to use the exchange: quickstart, purchasing rules, market data, receipts, troubleshooting, harness setup, agent SDKs, modalities and becoming a provider.
+
 ## Provider reference code
 
 | Language | Code | Guide |
