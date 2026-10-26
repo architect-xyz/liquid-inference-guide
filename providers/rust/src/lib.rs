@@ -1,4 +1,4 @@
-//! A reference provider agent for one text deployment of the Liquid Inference
+//! A reference provider agent for one deployment (text, image, speech or video) of the Liquid Inference
 //! exchange.
 //!
 //! [`session`] keeps the WebSocket session and the quote. [`dispatch`] serves
@@ -7,6 +7,7 @@
 pub mod config;
 pub mod dispatch;
 pub mod journal;
+pub mod media;
 pub mod protocol;
 pub mod session;
 pub mod state;

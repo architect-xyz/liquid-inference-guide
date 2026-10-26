@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, Kind};
 use crate::journal::Journal;
+use crate::media;
 use crate::state::{Shared, Snapshot};
 use crate::upstream::{self, UpstreamStatus};
 
@@ -31,9 +32,13 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/dispatch", post(dispatch))
-        .route("/health", get(health))
+        .route("/health", get(health));
+    if state.config.kind == Kind::VideoGeneration {
+        router = router.route("/content", post(media::content));
+    }
+    router
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
@@ -136,11 +141,19 @@ impl std::fmt::Display for ClientGone {
 
 impl std::error::Error for ClientGone {}
 
-async fn emit(sender: &mpsc::Sender<Bytes>, event: &Value) -> Result<()> {
+pub(crate) async fn emit(sender: &mpsc::Sender<Bytes>, event: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(event)?;
     line.push(b'\n');
     sender
         .send(Bytes::from(line))
+        .await
+        .map_err(|_| ClientGone.into())
+}
+
+/// A blank line tells the exchange that the render is alive.
+pub(crate) async fn keep_alive(sender: &mpsc::Sender<Bytes>) -> Result<()> {
+    sender
+        .send(Bytes::from_static(b"\n"))
         .await
         .map_err(|_| ClientGone.into())
 }
@@ -156,7 +169,13 @@ async fn stream_job(state: AppState, model: Snapshot, body: Value, sender: mpsc:
             warn!(%award_id, error = format!("{source:#}"), "dispatch failed");
             let message = match source.downcast_ref::<UpstreamStatus>() {
                 Some(status) => status.to_string(),
-                None => "the upstream did not return a valid text response".to_string(),
+                None => format!(
+                    "the upstream did not return a valid {} response",
+                    match model.kind {
+                        Kind::Chat => "text",
+                        kind => kind.as_str(),
+                    }
+                ),
             };
             let _ = emit(
                 &sender,
@@ -168,6 +187,20 @@ async fn stream_job(state: AppState, model: Snapshot, body: Value, sender: mpsc:
 }
 
 async fn run_job(
+    state: &AppState,
+    model: &Snapshot,
+    body: &Value,
+    sender: &mpsc::Sender<Bytes>,
+) -> Result<()> {
+    match model.kind {
+        Kind::Chat => chat(state, model, body, sender).await,
+        Kind::ImageGeneration => media::image(state, model, body, sender).await,
+        Kind::AudioSpeech => media::speech(state, model, body, sender).await,
+        Kind::VideoGeneration => media::video(state, model, body, sender).await,
+    }
+}
+
+async fn chat(
     state: &AppState,
     model: &Snapshot,
     body: &Value,
@@ -255,19 +288,27 @@ async fn validate(state: &AppState, body: &Value) -> Result<Snapshot> {
     if model.model_id != notice.offer_id || model.model != notice.served_model {
         bail!("dispatch does not match the deployment");
     }
-    let Some(limit) = body.get("max_output_tokens").and_then(Value::as_u64) else {
-        bail!("dispatch requires max_output_tokens");
-    };
-    let allowed = model
-        .max_output_tokens
-        .map_or(notice.max_output_tokens, |max| {
-            max.min(notice.max_output_tokens)
-        });
-    if limit == 0 || limit > allowed {
-        bail!("dispatch exceeds the output limit");
+    if model.kind == Kind::Chat {
+        let Some(limit) = body.get("max_output_tokens").and_then(Value::as_u64) else {
+            bail!("dispatch requires max_output_tokens");
+        };
+        let allowed = model
+            .max_output_tokens
+            .map_or(notice.max_output_tokens, |max| {
+                max.min(notice.max_output_tokens)
+            });
+        if limit == 0 || limit > allowed {
+            bail!("dispatch exceeds the output limit");
+        }
+    } else {
+        // A media job has no token output. Its bound is the object of its kind.
+        let key = media::bound_key(model.kind);
+        if !body.get(key).is_some_and(Value::is_object) {
+            bail!("dispatch needs the {key} object of its kind");
+        }
     }
 
-    const UNSUPPORTED: [&str; 16] = [
+    const UNSUPPORTED: [&str; 13] = [
         "tools",
         "tool_choice",
         "response_format",
@@ -280,12 +321,19 @@ async fn validate(state: &AppState, body: &Value) -> Result<Snapshot> {
         "frequency_penalty",
         "presence_penalty",
         "reasoning",
-        "image",
-        "audio",
-        "video",
         "pricing_unit",
     ];
-    if UNSUPPORTED.iter().any(|key| truthy(body.get(*key))) {
+    // Only a chat deployment refuses the objects of the media kinds.
+    let media_objects: &[&str] = if model.kind == Kind::Chat {
+        &["image", "audio", "video"]
+    } else {
+        &[]
+    };
+    if UNSUPPORTED
+        .iter()
+        .chain(media_objects)
+        .any(|key| truthy(body.get(*key)))
+    {
         bail!("dispatch requires an unsupported feature");
     }
     match body.get("cache") {

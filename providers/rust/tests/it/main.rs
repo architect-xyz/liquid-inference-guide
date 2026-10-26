@@ -3,4 +3,5 @@
 
 mod dispatch;
 mod harness;
+mod media;
 mod session;

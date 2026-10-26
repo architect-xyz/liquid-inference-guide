@@ -39,15 +39,35 @@ pub struct ServiceClass {
     pub completion_ms: u64,
 }
 
-/// Rates are USD per million tokens, as JSON numbers.
+/// The prices of a quote, as JSON numbers. A chat deployment quotes USD per
+/// million tokens. Each media kind quotes one unit rate, in USD, and nothing
+/// else.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Rates {
+    Tokens {
+        rate_uncached_input: f64,
+        rate_cache_read: f64,
+        rate_generation: f64,
+    },
+    PerImage {
+        rate_per_image: f64,
+    },
+    PerCharacter {
+        rate_per_character: f64,
+    },
+    PerVideoSecond {
+        rate_per_video_second: f64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Quote {
     pub target: QuoteTarget,
     pub execution_ref: String,
     pub execution_limits: ExecutionLimits,
-    pub rate_uncached_input: f64,
-    pub rate_cache_read: f64,
-    pub rate_generation: f64,
+    #[serde(flatten)]
+    pub rates: Rates,
     pub fixed_fee: f64,
     pub service_class: ServiceClass,
     pub supported_features: Vec<String>,
@@ -105,6 +125,10 @@ pub enum ExchangeMessage {
     Unknown,
 }
 
+fn provider_native() -> String {
+    "provider-native".to_string()
+}
+
 /// One deployment in a `listed` frame. A text deployment has `kind` `chat` and
 /// `pricing_unit` `tokens`; both default to that when absent.
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +136,7 @@ pub struct ListedModel {
     pub model_id: String,
     pub deployment_name: String,
     pub model: String,
+    #[serde(default = "provider_native")]
     pub tokenizer_id: String,
     pub max_input_tokens: u64,
     #[serde(default)]
@@ -148,9 +173,11 @@ mod tests {
                 max_input_tokens: 10,
                 max_output_tokens: None,
             },
-            rate_uncached_input: 0.1,
-            rate_cache_read: 0.02,
-            rate_generation: 0.2,
+            rates: Rates::Tokens {
+                rate_uncached_input: 0.1,
+                rate_cache_read: 0.02,
+                rate_generation: 0.2,
+            },
             fixed_fee: 0.0,
             service_class: ServiceClass {
                 ttft_ms: 1500,
@@ -169,6 +196,16 @@ mod tests {
         );
         assert_eq!(value["execution_limits"]["max_output_tokens"], Value::Null);
         assert_eq!(value["revision"], 3);
+        assert_eq!(value["rate_generation"], 0.2);
+    }
+
+    #[test]
+    fn a_media_quote_carries_only_its_unit_rate() {
+        let value = serde_json::to_value(Rates::PerImage {
+            rate_per_image: 0.04,
+        })
+        .unwrap();
+        assert_eq!(value, json!({"rate_per_image": 0.04}));
     }
 
     #[test]

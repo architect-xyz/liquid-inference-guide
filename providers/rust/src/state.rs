@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::config::Kind;
 use crate::protocol::{AwardNotice, ListedModel};
 
 /// The deployment as `listed` described it, with the `execution_ref` that
@@ -21,14 +22,19 @@ pub struct Snapshot {
     pub max_input_tokens: u64,
     pub max_output_tokens: Option<u64>,
     pub reference: String,
+    pub kind: Kind,
 }
 
 impl Snapshot {
-    pub fn from_listed(model: &ListedModel) -> Result<Self> {
-        if model.kind.as_deref().unwrap_or("chat") != "chat"
-            || model.pricing_unit.as_deref().unwrap_or("tokens") != "tokens"
+    pub fn from_listed(model: &ListedModel, kind: Kind) -> Result<Self> {
+        if model.kind.as_deref().unwrap_or("chat") != kind.as_str() {
+            bail!("the deployment is not a {} deployment", kind.as_str());
+        }
+        // An image deployment can be priced in tokens. The reference prices each image.
+        if let Some(unit) = &model.pricing_unit
+            && (unit == "tokens") != (kind == Kind::Chat)
         {
-            bail!("the reference requires a text deployment with token prices");
+            bail!("the pricing unit of the deployment does not match its kind");
         }
         Ok(Self {
             model_id: model.model_id.clone(),
@@ -37,6 +43,7 @@ impl Snapshot {
             max_input_tokens: model.max_input_tokens,
             max_output_tokens: model.max_output_tokens,
             reference: Uuid::new_v4().to_string(),
+            kind,
         })
     }
 
