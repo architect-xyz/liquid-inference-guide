@@ -14,9 +14,13 @@ export interface QuoteFrame {
   target: { kind: "registered"; model_id: string };
   execution_ref: string;
   execution_limits: { max_input_tokens: number; max_output_tokens: number | null };
-  rate_uncached_input: number;
-  rate_cache_read: number;
-  rate_generation: number;
+  /** A chat quote carries the three token rates. A media quote carries one unit rate instead. */
+  rate_uncached_input?: number;
+  rate_cache_read?: number;
+  rate_generation?: number;
+  rate_per_image?: number;
+  rate_per_character?: number;
+  rate_per_video_second?: number;
   fixed_fee: number;
   service_class: { ttft_ms: number; completion_ms: number };
   supported_features: string[];
@@ -47,8 +51,9 @@ export interface ListedModel {
   tokenizerId: string;
   maxInputTokens: number;
   maxOutputTokens: number | null;
-  /** True when the deployment is a text deployment priced in tokens. */
-  supported: boolean;
+  /** The kind that the exchange lists, `chat` when it states none. */
+  kind: string;
+  pricingUnit: string | undefined;
 }
 
 export interface QuoteAckFrame {
@@ -128,8 +133,7 @@ function parseListedModel(value: unknown): ListedModel | undefined {
   const rawOutput = value["max_output_tokens"];
   const maxOutputTokens = rawOutput === null || rawOutput === undefined ? null : int(rawOutput);
   if (maxOutputTokens === undefined) return undefined;
-  const kind = value["kind"] ?? "chat";
-  const unit = value["pricing_unit"] ?? "tokens";
+  const kind = str(value["kind"]) ?? "chat";
   return {
     modelId,
     deploymentName,
@@ -137,7 +141,8 @@ function parseListedModel(value: unknown): ListedModel | undefined {
     tokenizerId,
     maxInputTokens,
     maxOutputTokens,
-    supported: kind === "chat" && unit === "tokens",
+    kind,
+    pricingUnit: str(value["pricing_unit"]),
   };
 }
 
@@ -240,7 +245,20 @@ export interface UsageReport {
   raw: JsonObject;
 }
 
+/** The unit that a media deployment is priced in. */
+export type MediaMeters = { images: number } | { characters: number } | { video_seconds: number };
+
+export interface MediaUsage {
+  meters: MediaMeters;
+  tokenizer_id: string;
+  raw: JsonObject;
+}
+
 export type DispatchEvent =
   | { type: "delta"; text: string }
   | { type: "done"; finish_reason: "stop" | "length" | "content_filter"; usage: UsageReport }
+  | { type: "done"; finish_reason: "stop"; usage: MediaUsage }
+  | { type: "image"; index: number; b64_json?: string; url?: string; mime: string }
+  | { type: "audio"; b64_audio: string; mime: string }
+  | { type: "video_ready"; handle: string; token: string; mime: string; bytes?: number; expires_at?: string }
   | { type: "failed"; code: string; message: string };

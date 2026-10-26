@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import WebSocket from "ws";
-import { sessionUrl, type Settings } from "./config.js";
+import { MEDIA, sessionUrl, type DeploymentKind, type Settings } from "./config.js";
 import type { Logger } from "./log.js";
 import {
   parseExchangeFrame,
@@ -28,6 +28,7 @@ export interface Snapshot {
   maxOutputTokens: number | null;
   /** Names this snapshot in the quote and in the dispatch. */
   reference: string;
+  kind: DeploymentKind;
 }
 
 export interface AwardRecord {
@@ -57,7 +58,13 @@ interface Connection {
   lastSent: number;
 }
 
-function snapshotOf(model: ListedModel): Snapshot {
+/** Whether the listed deployment is one that this agent serves: its kind and its pricing unit must match. */
+function serves(model: ListedModel, kind: DeploymentKind): boolean {
+  if (model.kind !== kind) return false;
+  return model.pricingUnit === undefined || (model.pricingUnit === "tokens") === (kind === "chat");
+}
+
+function snapshotOf(model: ListedModel, kind: DeploymentKind): Snapshot {
   return {
     modelId: model.modelId,
     model: model.model,
@@ -65,6 +72,7 @@ function snapshotOf(model: ListedModel): Snapshot {
     maxInputTokens: model.maxInputTokens,
     maxOutputTokens: model.maxOutputTokens,
     reference: randomUUID(),
+    kind,
   };
 }
 
@@ -258,11 +266,8 @@ export class SessionClient {
         max_input_tokens: model.maxInputTokens,
         max_output_tokens: model.maxOutputTokens,
       },
-      rate_uncached_input: this.settings.rateInput,
-      rate_cache_read: this.settings.rateCacheRead,
-      rate_generation: this.settings.rateOutput,
+      ...this.terms(),
       fixed_fee: 0,
-      service_class: { ttft_ms: 1500, completion_ms: 30000 },
       supported_features: ["text"],
       retention_policy_supported: [this.settings.retention],
       valid_for_ms: this.settings.quoteLifetimeMs,
@@ -270,6 +275,33 @@ export class SessionClient {
     };
     this.send(connection, frame);
     connection.refreshAt = sentAt + this.settings.quoteLifetimeMs / 2;
+  }
+
+  /** The prices and deadlines of a quote. Each kind quotes its own unit. */
+  private terms(): Pick<
+    QuoteFrame,
+    | "rate_uncached_input"
+    | "rate_cache_read"
+    | "rate_generation"
+    | "rate_per_image"
+    | "rate_per_character"
+    | "rate_per_video_second"
+    | "service_class"
+  > {
+    const { kind, completionMs } = this.settings;
+    if (kind === "chat") {
+      return {
+        rate_uncached_input: this.settings.rateInput,
+        rate_cache_read: this.settings.rateCacheRead,
+        rate_generation: this.settings.rateOutput,
+        service_class: { ttft_ms: 1500, completion_ms: 30000 },
+      };
+    }
+    // A media job arrives whole, so its first output and its end are one time.
+    return {
+      [MEDIA[kind].field]: this.settings.unitRate,
+      service_class: { ttft_ms: completionMs, completion_ms: completionMs },
+    };
   }
 
   private receive(connection: Connection, frame: ExchangeFrame): void {
@@ -348,10 +380,11 @@ export class SessionClient {
     const previous = connection.selected;
     connection.retiring = false;
     connection.refreshAt = Infinity;
-    if (match !== undefined && !match.supported) {
+    const supported = match !== undefined && serves(match, this.settings.kind);
+    if (match !== undefined && !supported) {
       this.log("deployment_unsupported", { deployment: this.settings.deploymentName });
     }
-    let selected = match !== undefined && match.supported ? snapshotOf(match) : undefined;
+    let selected = match !== undefined && supported ? snapshotOf(match, this.settings.kind) : undefined;
     if (selected !== undefined && previous !== undefined && sameIdentity(selected, previous)) {
       selected = previous;
     } else if (previous !== undefined) {

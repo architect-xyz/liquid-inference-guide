@@ -7,18 +7,21 @@
 #   "simplejson>=3.20",
 # ]
 # ///
-"""A reference provider for one text deployment."""
+"""A reference provider for one deployment: text, image, speech or video."""
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import os
 import socket
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import TracebackType
@@ -32,7 +35,45 @@ from aiohttp import ClientError, ClientSession, ClientWebSocketResponse, WSMsgTy
 from openai import AsyncOpenAI, OpenAIError
 from openai.types.chat import ChatCompletionMessageParam
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+
+KINDS = ("chat", "image_generation", "audio_speech", "video_generation")
+# The rate that each media kind quotes, the quote field that carries it, and the
+# time in which the kind commits to finish a job.
+MEDIA = {
+    "image_generation": ("RATE_PER_IMAGE", "rate_per_image", 90_000),
+    "audio_speech": ("RATE_PER_CHARACTER", "rate_per_character", 30_000),
+    "video_generation": ("RATE_PER_VIDEO_SECOND", "rate_per_video_second", 300_000),
+}
+IMAGE_TYPES = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg", "webp": "image/webp"}
+AUDIO_TYPES = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "pcm": "audio/pcm",
+}
+
+
+Emit = Callable[[dict[str, Any] | None], Awaitable[None]]
+
+
+def prompt_of(body: dict[str, Any]) -> str:
+    """The prompt of a media job is the last user turn."""
+    turns = [m["content"] for m in body["messages"] if m["role"] == "user"]
+    if not turns or not turns[-1]:
+        raise ValueError("a media dispatch needs a user prompt")
+    return str(turns[-1])
+
+
+def done(meters: dict[str, int], tokenizer_id: str) -> dict[str, Any]:
+    """The last event of a media job. The meter is the unit that the deployment is priced in."""
+    return {
+        "type": "done",
+        "finish_reason": "stop",
+        "usage": {"meters": meters, "tokenizer_id": tokenizer_id, "raw": {}},
+    }
 
 
 def log(event: str, **fields: object) -> None:
@@ -57,6 +98,13 @@ class Settings:
     quote_lifetime_ms: int
     upstream_timeout: float
     shutdown_timeout: float
+    kind: str = "chat"
+    # USD for each unit of the deployment's kind. A chat deployment uses the token rates.
+    unit_rate: Decimal = Decimal(0)
+    completion_ms: int = 30_000
+    content_key: str = ""
+    poll_seconds: float = 2.0
+    render_timeout: float = 540.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Settings":
@@ -84,6 +132,13 @@ class Settings:
                 raise ValueError(f"LIQUID_{name} must be between zero and 3600 seconds")
             return value
 
+        kind = env.get("LIQUID_DEPLOYMENT_KIND", "chat").strip() or "chat"
+        if kind not in KINDS:
+            raise ValueError(f"LIQUID_DEPLOYMENT_KIND must be one of {', '.join(KINDS)}")
+        media = MEDIA.get(kind)
+        content_key = env.get("LIQUID_CONTENT_KEY", "").strip()
+        if kind == "video_generation" and not content_key:
+            raise ValueError("LIQUID_CONTENT_KEY is required for a video deployment")
         exchange = required("EXCHANGE_URL").rstrip("/")
         upstream = required("UPSTREAM_BASE_URL").rstrip("/")
         dispatch = required("DISPATCH_URL")
@@ -114,15 +169,38 @@ class Settings:
             dispatch,
             upstream,
             required("UPSTREAM_API_KEY"),
-            rate("RATE_INPUT"),
-            rate("RATE_CACHE_READ"),
-            rate("RATE_OUTPUT"),
+            rate("RATE_INPUT") if media is None else Decimal(0),
+            rate("RATE_CACHE_READ") if media is None else Decimal(0),
+            rate("RATE_OUTPUT") if media is None else Decimal(0),
             retention,
             Path(required("AWARD_DB")),
             lifetime,
             duration("UPSTREAM_TIMEOUT_SECONDS", "30"),
             duration("SHUTDOWN_TIMEOUT_SECONDS", "35"),
+            kind,
+            rate(media[0]) if media else Decimal(0),
+            int(env.get("LIQUID_COMPLETION_MS", media[2] if media else 30_000)),
+            content_key,
+            duration("UPSTREAM_POLL_SECONDS", "2"),
+            duration("UPSTREAM_RENDER_TIMEOUT_SECONDS", "540"),
         )
+
+    # doc:start terms
+    def terms(self) -> dict[str, object]:
+        """The prices and deadlines of a quote. Each kind quotes its own unit."""
+        if self.kind == "chat":
+            return {
+                "rate_uncached_input": self.input_rate,
+                "rate_cache_read": self.cache_rate,
+                "rate_generation": self.output_rate,
+                "service_class": {"ttft_ms": 1500, "completion_ms": 30000},
+            }
+        field = MEDIA[self.kind][1]
+        # A media job arrives whole, so its first output and its end are one time.
+        deadline = {"ttft_ms": self.completion_ms, "completion_ms": self.completion_ms}
+        return {field: self.unit_rate, "service_class": deadline}
+
+    # doc:end terms
 
 
 def count(value: object) -> int:
@@ -232,18 +310,24 @@ class Snapshot:
     # None when the deployment states no output limit.
     max_output_tokens: int | None
     reference: str
+    kind: str = "chat"
 
     @classmethod
-    def from_model(cls, model: dict[str, Any]) -> "Snapshot":
-        if model.get("kind", "chat") != "chat" or model.get("pricing_unit", "tokens") != "tokens":
-            raise ValueError("the reference requires a text deployment with token prices")
+    def from_model(cls, model: dict[str, Any], kind: str = "chat") -> "Snapshot":
+        if model.get("kind", "chat") != kind:
+            raise ValueError(f"the deployment is not a {kind} deployment")
+        # An image deployment can be priced in tokens. The reference prices each image.
+        unit = model.get("pricing_unit")
+        if unit is not None and (unit == "tokens") != (kind == "chat"):
+            raise ValueError("the pricing unit of the deployment does not match its kind")
         return cls(
             model["model_id"],
             model["model"],
-            model["tokenizer_id"],
+            model.get("tokenizer_id", "provider-native"),
             model["max_input_tokens"],
             model.get("max_output_tokens"),
             str(uuid4()),
+            kind,
         )
 
     def identity(self) -> tuple[str, str, str, int, int | None]:
@@ -296,11 +380,8 @@ class Connection:
                     "max_input_tokens": model.max_input_tokens,
                     "max_output_tokens": model.max_output_tokens,
                 },
-                "rate_uncached_input": self.settings.input_rate,
-                "rate_cache_read": self.settings.cache_rate,
-                "rate_generation": self.settings.output_rate,
+                **self.settings.terms(),
                 "fixed_fee": 0,
-                "service_class": {"ttft_ms": 1500, "completion_ms": 30000},
                 "supported_features": ["text"],
                 "retention_policy_supported": [self.settings.retention],
                 "valid_for_ms": self.settings.quote_lifetime_ms,
@@ -332,7 +413,9 @@ class Connection:
             previous = self.selected
             self.retiring = False
             self.refresh_at = float("inf")
-            self.selected = Snapshot.from_model(matches[0]) if len(matches) == 1 else None
+            self.selected = (
+                Snapshot.from_model(matches[0], self.settings.kind) if len(matches) == 1 else None
+            )
             if self.selected and previous and self.selected.identity() == previous.identity():
                 self.selected = previous
             elif previous:
@@ -566,11 +649,18 @@ class Runtime:
             max_retries=0,
             timeout=settings.upstream_timeout,
         )
+        self.media = httpx.AsyncClient(
+            base_url=settings.upstream_url + "/",
+            headers={"Authorization": f"Bearer {settings.upstream_key}"},
+            timeout=settings.upstream_timeout,
+        )
         self.task: asyncio.Task[None] | None = None
 
     def application(self) -> web.Application:
         app = web.Application(client_max_size=1024 * 1024)
         app.router.add_post("/dispatch", self.dispatch)
+        if self.settings.kind == "video_generation":
+            app.router.add_post("/content", self.content)
         app.router.add_get("/health", self.health)
         app.on_startup.append(self.start)
         app.on_shutdown.append(self.shutdown)
@@ -596,6 +686,7 @@ class Runtime:
 
     async def close(self, app: web.Application) -> None:
         await self.upstream.close()
+        await self.media.aclose()
         self.journal.connection.close()
 
     async def health(self, request: web.Request) -> web.Response:
@@ -618,17 +709,28 @@ class Runtime:
             raise ValueError("dispatch execution_ref does not match the award")
         if model.model_id != body["offer_id"] or model.model != body["served_model"]:
             raise ValueError("dispatch does not match the deployment")
-        limit = count(body.get("max_output_tokens"))
-        allowed = notice["max_output_tokens"]
-        if model.max_output_tokens is not None:
-            allowed = min(allowed, model.max_output_tokens)
-        if not 0 < limit <= allowed:
-            raise ValueError("dispatch exceeds the output limit")
+        if model.kind == "chat":
+            limit = count(body.get("max_output_tokens"))
+            allowed = notice["max_output_tokens"]
+            if model.max_output_tokens is not None:
+                allowed = min(allowed, model.max_output_tokens)
+            if not 0 < limit <= allowed:
+                raise ValueError("dispatch exceeds the output limit")
+        else:
+            # A media job has no token output. Its bound is the object of its kind.
+            bound_key = {"image_generation": "image", "audio_speech": "audio"}.get(
+                model.kind, "video"
+            )
+            if not isinstance(body.get(bound_key), dict):
+                raise ValueError(f"dispatch needs the {bound_key} object of its kind")
         unsupported = (
             "tools",
             "tool_choice",
             "response_format",
             "top_p",
+            "top_k",
+            "min_p",
+            "repetition_penalty",
             "stop",
             "seed",
             "logprobs",
@@ -637,10 +739,8 @@ class Runtime:
             "frequency_penalty",
             "presence_penalty",
             "reasoning",
-            "image",
-            "audio",
-            "video",
             "pricing_unit",
+            *(("image", "audio", "video") if model.kind == "chat" else ()),
         )
         if any(body.get(key) not in (None, [], {}) for key in unsupported):
             raise ValueError("dispatch requires an unsupported feature")
@@ -693,57 +793,18 @@ class Runtime:
         response = web.StreamResponse(headers={"Content-Type": "application/x-ndjson"})
         await response.prepare(request)
 
-        async def emit(event: dict[str, Any]) -> None:
-            await response.write((json.dumps(event) + "\n").encode())
+        async def emit(event: dict[str, Any] | None) -> None:
+            # A blank line tells the exchange that the render is alive.
+            await response.write(b"\n" if event is None else (json.dumps(event) + "\n").encode())
 
+        serve = {
+            "chat": self.chat,
+            "image_generation": self.image,
+            "audio_speech": self.speech,
+            "video_generation": self.video,
+        }[model.kind]
         try:
-            # doc:start upstream
-            stream = await self.upstream.chat.completions.create(
-                model=model.model,
-                messages=cast(
-                    list[ChatCompletionMessageParam],
-                    [
-                        {"role": message["role"], "content": message["content"]}
-                        for message in body["messages"]
-                    ],
-                ),
-                max_tokens=body["max_output_tokens"],
-                temperature=body.get("temperature"),
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-            raw: dict[str, Any] | None = None
-            finish_reason: str | None = None
-            output_sent = False
-            async with stream:
-                async for chunk in stream:
-                    if chunk.usage is not None:
-                        raw = chunk.usage.model_dump(mode="json", exclude_unset=True)
-                    for choice in chunk.choices:
-                        if choice.delta.tool_calls or choice.delta.function_call:
-                            raise ValueError("upstream returned a tool call")
-                        if choice.delta.model_extra and any(
-                            choice.delta.model_extra.get(key)
-                            for key in ("reasoning", "reasoning_content", "reasoning_details")
-                        ):
-                            raise ValueError("upstream returned reasoning")
-                        if choice.delta.content:
-                            await emit({"type": "delta", "text": choice.delta.content})
-                            if not output_sent:
-                                log("first_output", award_id=body["award_id"])
-                                output_sent = True
-                        if choice.finish_reason is not None:
-                            finish_reason = choice.finish_reason
-            if raw is None or finish_reason not in {"stop", "length", "content_filter"}:
-                raise ValueError("upstream ended without valid usage and finish_reason")
-            await emit(
-                {
-                    "type": "done",
-                    "finish_reason": finish_reason,
-                    "usage": usage_report(raw, model.tokenizer_id),
-                }
-            )
-            # doc:end upstream
+            await serve(body, model, emit)
         except (OpenAIError, httpx.HTTPError, ValueError, TypeError, OSError) as error:
             log("dispatch_failed", award_id=body["award_id"], error=type(error).__name__)
             if request.transport is not None and not request.transport.is_closing():
@@ -751,10 +812,205 @@ class Runtime:
                     {
                         "type": "failed",
                         "code": "upstream_failed",
-                        "message": "the upstream did not return a valid text response",
+                        "message": f"the upstream did not return a valid {model.kind} response",
                     }
                 )
         return response
+
+    async def chat(self, body: dict[str, Any], model: Snapshot, emit: Emit) -> None:
+        # doc:start upstream
+        stream = await self.upstream.chat.completions.create(
+            model=model.model,
+            messages=cast(
+                list[ChatCompletionMessageParam],
+                [
+                    {"role": message["role"], "content": message["content"]}
+                    for message in body["messages"]
+                ],
+            ),
+            max_tokens=body["max_output_tokens"],
+            temperature=body.get("temperature"),
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        raw: dict[str, Any] | None = None
+        finish_reason: str | None = None
+        output_sent = False
+        async with stream:
+            async for chunk in stream:
+                if chunk.usage is not None:
+                    raw = chunk.usage.model_dump(mode="json", exclude_unset=True)
+                for choice in chunk.choices:
+                    if choice.delta.tool_calls or choice.delta.function_call:
+                        raise ValueError("upstream returned a tool call")
+                    if choice.delta.model_extra and any(
+                        choice.delta.model_extra.get(key)
+                        for key in ("reasoning", "reasoning_content", "reasoning_details")
+                    ):
+                        raise ValueError("upstream returned reasoning")
+                    if choice.delta.content:
+                        await emit({"type": "delta", "text": choice.delta.content})
+                        if not output_sent:
+                            log("first_output", award_id=body["award_id"])
+                            output_sent = True
+                    if choice.finish_reason is not None:
+                        finish_reason = choice.finish_reason
+        if raw is None or finish_reason not in {"stop", "length", "content_filter"}:
+            raise ValueError("upstream ended without valid usage and finish_reason")
+        await emit(
+            {
+                "type": "done",
+                "finish_reason": finish_reason,
+                "usage": usage_report(raw, model.tokenizer_id),
+            }
+        )
+        # doc:end upstream
+
+    # doc:start image
+    async def image(self, body: dict[str, Any], model: Snapshot, emit: Emit) -> None:
+        bound = body["image"]
+        request = {
+            "model": model.model,
+            "prompt": prompt_of(body),
+            "n": bound["count"],
+            **{
+                key: bound[key]
+                for key in ("size", "output_format", "quality", "response_format")
+                if bound.get(key)
+            },
+        }
+        answer = await self.media.post("images/generations", json=request)
+        answer.raise_for_status()
+        sent = 0
+        for index, item in enumerate(answer.json().get("data", [])):
+            # An entry with neither field is not an image, so the buyer does not pay for it.
+            if not item.get("b64_json") and not item.get("url"):
+                continue
+            kind = (bound.get("output_format") or "png").lower()
+            await emit(
+                {
+                    "type": "image",
+                    "index": index,
+                    **{key: item[key] for key in ("b64_json", "url") if item.get(key)},
+                    "mime": IMAGE_TYPES.get(kind, "image/png"),
+                }
+            )
+            sent += 1
+        if not 0 < sent <= bound["count"]:
+            raise ValueError("the upstream returned no image, or more than were asked for")
+        await emit(done({"images": sent}, model.tokenizer_id))
+
+    # doc:end image
+
+    # doc:start speech
+    async def speech(self, body: dict[str, Any], model: Snapshot, emit: Emit) -> None:
+        bound = body["audio"]
+        text = prompt_of(body)
+        request = {"model": model.model, "input": text, "voice": bound["voice"]}
+        for key in ("response_format", "speed"):
+            if bound.get(key) is not None:
+                request[key] = bound[key]
+        answer = await self.media.post("audio/speech", json=request)
+        answer.raise_for_status()
+        if not answer.content:
+            raise ValueError("the upstream returned no audio")
+        # The buyer needs the type of the file that came back, not the one that was asked for.
+        mime = answer.headers.get("content-type", "").split(";")[0].strip() or AUDIO_TYPES.get(
+            bound.get("response_format") or "mp3", "audio/mpeg"
+        )
+        await emit(
+            {"type": "audio", "b64_audio": base64.b64encode(answer.content).decode(), "mime": mime}
+        )
+        # The exchange counted the characters of the text, and it pays for no more.
+        await emit(done({"characters": len(text)}, model.tokenizer_id))
+
+    # doc:end speech
+
+    # doc:start video
+    async def video(self, body: dict[str, Any], model: Snapshot, emit: Emit) -> None:
+        bound = body["video"]
+        request: dict[str, Any] = {
+            "model": model.model,
+            "prompt": prompt_of(body),
+            "seconds": str(bound["seconds"]),
+        }
+        if bound.get("size"):
+            request["size"] = bound["size"]
+        created = await self.media.post("videos", json=request)
+        created.raise_for_status()
+        video_id = created.json().get("id")
+        if not isinstance(video_id, str) or not video_id or any(c in video_id for c in "/?#"):
+            raise ValueError("the upstream accepted the video job and returned no usable id")
+        log("video_accepted", award_id=body["award_id"], video=video_id)
+        finished = await self.render(video_id, emit)
+        # Read the file's headers before the exchange hears of it. A file that the upstream
+        # cannot serve fails the job now, and not as a failed download after the buyer paid.
+        async with self.media.stream("GET", f"videos/{video_id}/content") as file:
+            file.raise_for_status()
+            mime = file.headers.get("content-type", "").split(";")[0].strip()
+            size = int(file.headers.get("content-length") or 0)
+        if not mime.startswith("video/") or (size == 0 and "content-length" in file.headers):
+            raise ValueError("the upstream did not return a video file")
+        expires = finished.get("expires_at")
+        await emit(
+            {
+                "type": "video_ready",
+                "handle": video_id,
+                "token": self.sign(video_id),
+                "mime": mime,
+                **({"bytes": size} if size else {}),
+                **(
+                    {"expires_at": datetime.fromtimestamp(expires, UTC).isoformat()}
+                    if isinstance(expires, int)
+                    else {}
+                ),
+            }
+        )
+        await emit(done({"video_seconds": bound["seconds"]}, model.tokenizer_id))
+
+    # doc:end video
+
+    async def render(self, video_id: str, emit: Emit) -> dict[str, Any]:
+        """Asks about the render until it ends. A blank line each time keeps the dispatch open."""
+        async with asyncio.timeout(self.settings.render_timeout):
+            while True:
+                await asyncio.sleep(self.settings.poll_seconds)
+                await emit(None)
+                answer = await self.media.get(f"videos/{video_id}")
+                answer.raise_for_status()
+                job = answer.json()
+                if job.get("status") == "completed":
+                    return cast(dict[str, Any], job)
+                if job.get("status") not in {"queued", "in_progress"}:
+                    raise ValueError(f"the upstream ended the render as {job.get('status')!r}")
+
+    def sign(self, handle: str) -> str:
+        key = self.settings.content_key.encode()
+        return hmac.new(key, handle.encode(), hashlib.sha256).hexdigest()
+
+    async def content(self, request: web.Request) -> web.StreamResponse:
+        """Serves a finished video to the exchange, which proves itself with the token."""
+        try:
+            body = await request.json()
+            handle, token = body["handle"], body["token"]
+            if not isinstance(handle, str) or not isinstance(token, str):
+                raise TypeError
+        except (ValueError, KeyError, TypeError):
+            return web.json_response({"error": "invalid_content_request"}, status=400)
+        if not hmac.compare_digest(self.sign(handle), token) or any(c in handle for c in "/?#"):
+            return web.json_response({"error": "forbidden"}, status=403)
+        try:
+            async with self.media.stream("GET", f"videos/{handle}/content") as file:
+                file.raise_for_status()
+                response = web.StreamResponse(
+                    headers={"Content-Type": file.headers.get("content-type", "video/mp4")}
+                )
+                await response.prepare(request)
+                async for chunk in file.aiter_bytes():
+                    await response.write(chunk)
+                return response
+        except httpx.HTTPError:
+            return web.json_response({"error": "upstream_failed"}, status=502)
 
 
 def main() -> None:
