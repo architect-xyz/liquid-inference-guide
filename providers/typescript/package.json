@@ -1,6 +1,6 @@
 {
   "name": "liquid-provider-reference-ts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A reference Liquid Inference provider agent for one text deployment, in TypeScript",
   "private": true,
   "type": "module",

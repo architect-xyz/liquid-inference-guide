@@ -6,6 +6,21 @@ import { isCount, isRecord, isTruthy, isUnset, type JsonObject } from "./json.js
 import type { Logger } from "./log.js";
 import type { DispatchEvent } from "./protocol.js";
 import type { SessionClient, Snapshot } from "./session.js";
+import {
+  generateImages,
+  mediaDone,
+  openVideo,
+  promptOf,
+  renderVideo,
+  synthesizeSpeech,
+  tokenMatches,
+  usableHandle,
+  type AudioBound,
+  type Emit,
+  type ImageBound,
+  type MediaRequest,
+  type VideoBound,
+} from "./media.js";
 import { streamChat, UpstreamError } from "./upstream.js";
 import { usageReport } from "./usage.js";
 
@@ -28,11 +43,14 @@ const UNSUPPORTED = [
   "frequency_penalty",
   "presence_penalty",
   "reasoning",
-  "image",
-  "audio",
-  "video",
   "pricing_unit",
 ] as const;
+
+/** The objects of the media kinds. Only a chat deployment refuses them. */
+const MEDIA_OBJECTS = ["image", "audio", "video"] as const;
+
+/** The object that bounds a media job: the only limit it has in place of output tokens. */
+const BOUND_KEY = { image_generation: "image", audio_speech: "audio", video_generation: "video" } as const;
 
 class InvalidDispatch extends Error {}
 
@@ -43,7 +61,39 @@ interface Validated {
   snapshot: Snapshot;
   messages: Array<{ role: string; content: string }>;
   maxOutputTokens: number;
+  /** The object of the deployment's kind. Chat has none. */
+  bound: JsonObject;
   temperature: number | undefined;
+}
+
+function text(object: JsonObject, key: string): string | undefined {
+  const value = object[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new InvalidDispatch(`dispatch ${key} must be a string`);
+  return value;
+}
+
+/** Checks the fields of a bound that the upstream call reads, before any work starts. */
+function checkedBound(kind: "image_generation" | "audio_speech" | "video_generation", bound: JsonObject): JsonObject {
+  if (kind === "image_generation") {
+    if (!isCount(bound["count"]) || bound["count"] < 1) {
+      throw new InvalidDispatch("dispatch image count must be a positive integer");
+    }
+    for (const key of ["size", "output_format", "quality", "response_format"]) text(bound, key);
+  } else if (kind === "audio_speech") {
+    if (typeof bound["voice"] !== "string") throw new InvalidDispatch("dispatch audio voice must be a string");
+    text(bound, "response_format");
+    const speed = bound["speed"];
+    if (speed !== undefined && speed !== null && typeof speed !== "number") {
+      throw new InvalidDispatch("dispatch audio speed must be a number");
+    }
+  } else {
+    if (!isCount(bound["seconds"]) || bound["seconds"] < 1) {
+      throw new InvalidDispatch("dispatch video seconds must be a positive integer");
+    }
+    text(bound, "size");
+  }
+  return bound;
 }
 
 function sendJson(res: ServerResponse, status: number, body: JsonObject): void {
@@ -130,7 +180,72 @@ export class DispatchServer {
       await this.dispatch(req, res);
       return;
     }
+    if (path === "/content" && this.settings.kind === "video_generation") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "method_not_allowed" });
+        return;
+      }
+      await this.content(req, res);
+      return;
+    }
     sendJson(res, 404, { error: "not_found" });
+  }
+
+  private media(signal: AbortSignal): MediaRequest {
+    return {
+      baseUrl: this.settings.upstreamUrl,
+      apiKey: this.settings.upstreamKey,
+      timeoutMs: this.settings.upstreamTimeoutMs,
+      signal,
+    };
+  }
+
+  /** Serves a finished video to the exchange, which proves itself with the token. */
+  private async content(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let handle: unknown;
+    let token: unknown;
+    try {
+      const body: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+      if (!isRecord(body)) throw new InvalidDispatch("content request is not an object");
+      handle = body["handle"];
+      token = body["token"];
+      if (typeof handle !== "string" || typeof token !== "string") {
+        throw new InvalidDispatch("content request needs a handle and a token");
+      }
+    } catch {
+      sendJson(res, 400, { error: "invalid_content_request" });
+      return;
+    }
+    const { contentKey } = this.settings;
+    if (!tokenMatches(contentKey, handle, token) || !usableHandle(handle)) {
+      sendJson(res, 403, { error: "forbidden" });
+      return;
+    }
+    const abort = new AbortController();
+    res.on("close", () => {
+      if (!res.writableFinished) abort.abort();
+    });
+    let file: Awaited<ReturnType<typeof openVideo>>;
+    try {
+      file = await openVideo(this.media(abort.signal), handle);
+    } catch {
+      sendJson(res, 502, { error: "upstream_failed" });
+      return;
+    }
+    try {
+      res.writeHead(200, { "content-type": file.response.headers.get("content-type") ?? "video/mp4" });
+      const reader = file.response.body?.getReader();
+      for (;;) {
+        const read = await reader?.read();
+        if (read === undefined || read.done) break;
+        if (!res.write(read.value)) await new Promise<void>((resolve) => res.once("drain", resolve).once("close", resolve));
+      }
+    } catch (error) {
+      this.log("content_failed", { error: error instanceof Error ? error.name : "unknown" });
+    } finally {
+      file.close();
+      res.end();
+    }
   }
 
   private async validate(body: JsonObject, awardId: string): Promise<Validated> {
@@ -153,12 +268,24 @@ export class DispatchServer {
     if (snapshot.modelId !== body["offer_id"] || snapshot.model !== body["served_model"]) {
       throw new InvalidDispatch("dispatch does not match the deployment");
     }
-    const limit = body["max_output_tokens"];
-    if (!isCount(limit)) throw new InvalidDispatch("usage must contain non-negative integer counts");
-    let allowed = notice.notice.max_output_tokens;
-    if (snapshot.maxOutputTokens !== null) allowed = Math.min(allowed, snapshot.maxOutputTokens);
-    if (limit <= 0 || limit > allowed) throw new InvalidDispatch("dispatch exceeds the output limit");
-    if (UNSUPPORTED.some((key) => !isUnset(body[key]))) {
+    let limit = 0;
+    let bound: JsonObject = {};
+    if (snapshot.kind === "chat") {
+      const requested = body["max_output_tokens"];
+      if (!isCount(requested)) throw new InvalidDispatch("usage must contain non-negative integer counts");
+      let allowed = notice.notice.max_output_tokens;
+      if (snapshot.maxOutputTokens !== null) allowed = Math.min(allowed, snapshot.maxOutputTokens);
+      if (requested <= 0 || requested > allowed) throw new InvalidDispatch("dispatch exceeds the output limit");
+      limit = requested;
+    } else {
+      // A media job has no token output. Its bound is the object of its kind.
+      const key = BOUND_KEY[snapshot.kind];
+      const object = body[key];
+      if (!isRecord(object)) throw new InvalidDispatch(`dispatch needs the ${key} object of its kind`);
+      bound = checkedBound(snapshot.kind, object);
+    }
+    const refused = snapshot.kind === "chat" ? [...UNSUPPORTED, ...MEDIA_OBJECTS] : UNSUPPORTED;
+    if (refused.some((key) => !isUnset(body[key]))) {
       throw new InvalidDispatch("dispatch requires an unsupported feature");
     }
     const cache = isTruthy(body["cache"]) ? body["cache"] : {};
@@ -204,6 +331,7 @@ export class DispatchServer {
       snapshot,
       messages,
       maxOutputTokens: limit,
+      bound,
       temperature: typeof temperature === "number" ? temperature : undefined,
     };
   }
@@ -268,9 +396,9 @@ export class DispatchServer {
     res.writeHead(200, { "content-type": "application/x-ndjson" });
     res.flushHeaders();
 
-    const emit = async (event: DispatchEvent): Promise<void> => {
+    const emit: Emit = async (event) => {
       if (res.destroyed) throw new UpstreamError("buyer side closed");
-      if (!res.write(`${JSON.stringify(event)}\n`)) {
+      if (!res.write(event === null ? "\n" : `${JSON.stringify(event)}\n`)) {
         await new Promise<void>((resolve) => {
           const done = (): void => {
             res.off("drain", done);
@@ -284,37 +412,7 @@ export class DispatchServer {
     };
 
     try {
-      let raw: JsonObject | undefined;
-      let finishReason: string | undefined;
-      let outputSent = false;
-      for await (const event of streamChat({
-        baseUrl: this.settings.upstreamUrl,
-        apiKey: this.settings.upstreamKey,
-        model: job.snapshot.model,
-        messages: job.messages,
-        maxTokens: job.maxOutputTokens,
-        temperature: job.temperature,
-        idleTimeoutMs: this.settings.upstreamTimeoutMs,
-        signal: abort.signal,
-      })) {
-        if (event.kind === "usage") raw = event.raw;
-        else if (event.kind === "finish") finishReason = event.reason;
-        else {
-          await emit({ type: "delta", text: event.text });
-          if (!outputSent) {
-            this.log("first_output", { award_id: job.awardId });
-            outputSent = true;
-          }
-        }
-      }
-      if (raw === undefined || finishReason === undefined || !FINISH_REASONS.has(finishReason)) {
-        throw new UpstreamError("upstream ended without valid usage and finish_reason");
-      }
-      await emit({
-        type: "done",
-        finish_reason: finishReason as "stop" | "length" | "content_filter",
-        usage: usageReport(raw, job.snapshot.tokenizerId),
-      });
+      await this.serve(job, abort.signal, emit);
     } catch (error) {
       this.log("dispatch_failed", {
         award_id: job.awardId,
@@ -326,10 +424,72 @@ export class DispatchServer {
         await emit({
           type: "failed",
           code: "upstream_failed",
-          message: report ?? "the upstream did not return a valid text response",
+          message: report ?? `the upstream did not return a valid ${job.snapshot.kind} response`,
         }).catch(() => {});
       }
     }
     res.end();
+  }
+
+  private async serve(job: Validated, signal: AbortSignal, emit: Emit): Promise<void> {
+    const { kind, model, tokenizerId } = job.snapshot;
+    if (kind === "chat") {
+      await this.chat(job, signal, emit);
+    } else if (kind === "image_generation") {
+      const bound = job.bound as unknown as ImageBound;
+      const sent = await generateImages(this.media(signal), model, promptOf(job.messages), bound, emit);
+      await emit(mediaDone({ images: sent }, tokenizerId));
+    } else if (kind === "audio_speech") {
+      const prompt = promptOf(job.messages);
+      await synthesizeSpeech(this.media(signal), model, prompt, job.bound as unknown as AudioBound, emit);
+      // The exchange counted the characters of the text, and it pays for no more.
+      await emit(mediaDone({ characters: [...prompt].length }, tokenizerId));
+    } else {
+      const bound = job.bound as unknown as VideoBound;
+      await renderVideo(
+        this.media(signal),
+        this.settings,
+        model,
+        promptOf(job.messages),
+        bound,
+        emit,
+        () => this.log("video_accepted", { award_id: job.awardId }),
+      );
+      await emit(mediaDone({ video_seconds: bound.seconds }, tokenizerId));
+    }
+  }
+
+  private async chat(job: Validated, signal: AbortSignal, emit: Emit): Promise<void> {
+    let raw: JsonObject | undefined;
+    let finishReason: string | undefined;
+    let outputSent = false;
+    for await (const event of streamChat({
+      baseUrl: this.settings.upstreamUrl,
+      apiKey: this.settings.upstreamKey,
+      model: job.snapshot.model,
+      messages: job.messages,
+      maxTokens: job.maxOutputTokens,
+      temperature: job.temperature,
+      idleTimeoutMs: this.settings.upstreamTimeoutMs,
+      signal,
+    })) {
+      if (event.kind === "usage") raw = event.raw;
+      else if (event.kind === "finish") finishReason = event.reason;
+      else {
+        await emit({ type: "delta", text: event.text });
+        if (!outputSent) {
+          this.log("first_output", { award_id: job.awardId });
+          outputSent = true;
+        }
+      }
+    }
+    if (raw === undefined || finishReason === undefined || !FINISH_REASONS.has(finishReason)) {
+      throw new UpstreamError("upstream ended without valid usage and finish_reason");
+    }
+    await emit({
+      type: "done",
+      finish_reason: finishReason as "stop" | "length" | "content_filter",
+      usage: usageReport(raw, job.snapshot.tokenizerId),
+    });
   }
 }

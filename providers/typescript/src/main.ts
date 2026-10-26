@@ -2,7 +2,7 @@ import { ConfigError, settingsFromEnv } from "./config.js";
 import { stdoutLogger } from "./log.js";
 import { Provider } from "./provider.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 function main(): void {
   let provider: Provider;
