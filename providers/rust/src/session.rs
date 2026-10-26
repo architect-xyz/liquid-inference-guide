@@ -12,9 +12,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, Kind};
 use crate::protocol::{
-    ExchangeMessage, ExecutionLimits, ProviderMessage, Quote, QuoteTarget, ServiceClass,
+    ExchangeMessage, ExecutionLimits, ProviderMessage, Quote, QuoteTarget, Rates, ServiceClass,
 };
 use crate::state::{Shared, Snapshot};
 
@@ -71,6 +71,41 @@ impl<'a> Connection<'a> {
         self.logged_in
     }
 
+    /// Each kind quotes its own unit.
+    fn rates(&self) -> Rates {
+        let rate = self.config.unit_rate;
+        match self.config.kind {
+            Kind::Chat => Rates::Tokens {
+                rate_uncached_input: self.config.rate_input,
+                rate_cache_read: self.config.rate_cache_read,
+                rate_generation: self.config.rate_output,
+            },
+            Kind::ImageGeneration => Rates::PerImage {
+                rate_per_image: rate,
+            },
+            Kind::AudioSpeech => Rates::PerCharacter {
+                rate_per_character: rate,
+            },
+            Kind::VideoGeneration => Rates::PerVideoSecond {
+                rate_per_video_second: rate,
+            },
+        }
+    }
+
+    fn service_class(&self) -> ServiceClass {
+        match self.config.kind {
+            Kind::Chat => ServiceClass {
+                ttft_ms: 1500,
+                completion_ms: 30000,
+            },
+            // A media job arrives whole, so its first output and its end are one time.
+            _ => ServiceClass {
+                ttft_ms: self.config.completion_ms,
+                completion_ms: self.config.completion_ms,
+            },
+        }
+    }
+
     pub fn quote(&mut self) {
         let Some(model) = self.selected.clone().filter(|_| !self.retiring) else {
             return;
@@ -87,14 +122,9 @@ impl<'a> Connection<'a> {
                 max_input_tokens: model.max_input_tokens,
                 max_output_tokens: model.max_output_tokens,
             },
-            rate_uncached_input: self.config.rate_input,
-            rate_cache_read: self.config.rate_cache_read,
-            rate_generation: self.config.rate_output,
+            rates: self.rates(),
             fixed_fee: 0.0,
-            service_class: ServiceClass {
-                ttft_ms: 1500,
-                completion_ms: 30000,
-            },
+            service_class: self.service_class(),
             supported_features: vec!["text".to_string()],
             retention_policy_supported: vec![self.config.retention.clone()],
             valid_for_ms: self.config.quote_lifetime.as_millis() as u64,
@@ -126,7 +156,7 @@ impl<'a> Connection<'a> {
                 self.retiring = false;
                 self.refresh_at = None;
                 self.selected = match matches.as_slice() {
-                    [model] => Some(Snapshot::from_listed(model)?),
+                    [model] => Some(Snapshot::from_listed(model, self.config.kind)?),
                     _ => None,
                 };
                 match (&mut self.selected, previous) {

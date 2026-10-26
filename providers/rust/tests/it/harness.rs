@@ -54,6 +54,20 @@ impl Conn {
     }
 
     pub async fn handshake_with_login(&mut self) -> (Value, Value) {
+        self.handshake_listing(json!({
+            "model_id": MODEL_ID,
+            "unverified": false,
+            "deployment_name": "gpt-oss",
+            "model": "gpt-oss-120b",
+            "tokenizer_id": "o200k_base",
+            "max_input_tokens": 128000,
+            "max_output_tokens": 4096,
+        }))
+        .await
+    }
+
+    /// Like `handshake_with_login`, with `deployment` as the listed deployment.
+    pub async fn handshake_listing(&mut self, deployment: Value) -> (Value, Value) {
         let login = self.recv().await;
         assert_eq!(login["type"], "login");
         self.send(json!({
@@ -73,15 +87,7 @@ impl Conn {
                     "tokenizer_id": "x",
                     "max_input_tokens": 1,
                 },
-                {
-                    "model_id": MODEL_ID,
-                    "unverified": false,
-                    "deployment_name": "gpt-oss",
-                    "model": "gpt-oss-120b",
-                    "tokenizer_id": "o200k_base",
-                    "max_input_tokens": 128000,
-                    "max_output_tokens": 4096,
-                },
+                deployment,
             ],
         }))
         .await;
